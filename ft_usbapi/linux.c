@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <sys/time.h>
 #include <dirent.h>
+#include <sys/epoll.h>
 
 #include "linux.h"
 #include "usbi.h"
@@ -170,13 +171,14 @@ int usb_control_msg(usb_dev_handle *dev, int requesttype, int request,
 
 /* Reading and writing are the same except for the endpoint */
 static int usb_urb_transfer(usb_dev_handle *dev, int ep, int urbtype,
-	char *bytes, int size, int timeout)
+ char *bytes, int size, int timeout)
 {
   struct usb_urb urb;
   int bytesdone = 0, requested;
   struct timeval tv, tv_ref, tv_now;
   struct usb_urb *context;
   int ret, waiting;
+  int epfd = -1;
 
   /*
    * HACK: The use of urb.usercontext is a hack to get threaded applications
@@ -201,7 +203,7 @@ static int usb_urb_transfer(usb_dev_handle *dev, int ep, int urbtype,
   }
 
   do {
-    fd_set writefds;
+    
 
     requested = size - bytesdone;
     if (requested > MAX_READ_WRITE)
@@ -214,24 +216,37 @@ static int usb_urb_transfer(usb_dev_handle *dev, int ep, int urbtype,
     urb.buffer_length = requested;
     urb.signr = 0;
     urb.actual_length = 0;
-    urb.number_of_packets = 0;	/* don't do isochronous yet */
+    urb.number_of_packets = 0; /* don't do isochronous yet */
     urb.usercontext = NULL;
-	
+ 
     ret = ioctl(dev->fd, IOCTL_USB_SUBMITURB, &urb);
     if (ret < 0) {
-	USB_ERROR_STR(-errno, "error submitting URB: %s", strerror(errno));
+ USB_ERROR_STR(-errno, "error submitting URB: %s", strerror(errno));
       return ret;
     }
-    FD_ZERO(&writefds);
-    FD_SET(dev->fd, &writefds);
+
 restart:
+    epfd = epoll_create(1);
+    if(epfd >= 0){
+      struct epoll_event ev;
+      memset(&ev, 0, sizeof(ev));
+      ev.events = EPOLLIN | EPOLLET;
+      if(epoll_ctl(epfd, EPOLL_CTL_ADD, dev->fd, &ev) != 0){
+        printf("###usb add epfd[%d] fd[%d] errno[%d]\n", epfd, dev->fd, errno);
+      }
+    }else{
+      printf("###usb ep create epfd[%d] errno[%d]\n", epfd, errno);
+    }
     waiting = 1;
     context = NULL;
     while (!urb.usercontext && ((ret = ioctl(dev->fd, IOCTL_USB_REAPURBNDELAY, &context)) == -1) && waiting) {
-      tv.tv_sec = 0;
-      tv.tv_usec = 1000; // 1 msec
-      select(dev->fd + 1, NULL, &writefds, NULL, &tv); //sub second wait
-
+      {      
+        struct epoll_event tempEv[1];
+        memset(tempEv, 0, sizeof(tempEv));
+        if(epoll_wait(epfd, tempEv, 1, 1) == -1){
+          printf("###usb ep wait epfd[%d] errno[%d]\n", epfd, errno);
+        }
+      }
       if (timeout) {
         /* compare with actual time, as the select timeout is not that precise */
         gettimeofday(&tv_now, NULL);
@@ -241,7 +256,11 @@ restart:
           waiting = 0;
       }
     }
-
+    if(epfd >= 0){
+      close(epfd);
+      epfd = -1;
+    }
+    
     if (context && context != &urb) {
       context->usercontext = URB_USERCONTEXT_COOKIE;
       /* We need to restart since we got a successful URB, but not ours */
@@ -278,7 +297,7 @@ restart:
      * we'll get the previous completion and exit early
      */
     ioctl(dev->fd, IOCTL_USB_REAPURB, &context);
-//	printf("rc=%d\n",rc);
+// printf("rc=%d\n",rc);
     return rc;
   }
 
